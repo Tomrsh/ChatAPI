@@ -1,4 +1,4 @@
-// server.js
+// server.js (Fast WebSocket Engine)
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -6,47 +6,69 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
-
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const io = new Server(server, { cors: { origin: "*" } });
+
+// Kiska UID kis Socket ID se connect hai, usko track karne ke liye
+const activeUsers = new Map(); 
 
 io.on('connection', (socket) => {
-    console.log(`⚡ New Connection: ${socket.id}`);
-
-    // User jab room join karega
-    socket.on('join_room', (data) => {
-        const { username, room } = data;
-        socket.join(room);
-        console.log(`👤 ${username} joined room: ${room}`);
-
-        // Room ke baaki logo ko notify karein (System Message)
-        // Note: System messages encrypted nahi hote kyunki ye server generate karta hai
-        socket.to(room).emit('system_message', {
-            text: `${username} has joined the chat room.`
-        });
+    
+    // 1. User Online Aaya
+    socket.on('user_online', (uid) => {
+        activeUsers.set(uid, socket.id);
+        console.log(`🟢 User Online: ${uid}`);
+        socket.broadcast.emit('user_status_change', { uid, status: 'online' });
     });
 
-    // Encrypted Message ya File receive aur forward karna
-    socket.on('send_secure_payload', (payload) => {
-        const { room, sender, data, type, fileName } = payload;
-        
-        // Sirf us specific room ke baaki members ko data bhejein
-        socket.to(room).emit('receive_secure_payload', {
-            sender,
-            data,      // Yeh encrypted string (ciphertext) hai
-            type,      // 'text' ya 'file'
-            fileName: fileName || null
-        });
+    // 2. Private 1-on-1 Message (E2EE)
+    socket.on('send_private_msg', (payload) => {
+        const { senderId, receiverId, encryptedData, msgId, timestamp } = payload;
+        const receiverSocketId = activeUsers.get(receiverId);
+
+        // Agar user online hai, turant bhej do (Fastest delivery)
+        if (receiverSocketId) {
+            io.to(receiverSocketId).emit('receive_private_msg', payload);
+            
+            // Sender ko "Delivered" (Double Gray Tick) ka status bhejo
+            socket.emit('msg_status_update', { msgId, status: 'delivered' });
+        } else {
+            // User offline hai -> Firebase me save karne ka logic frontend handle karega
+            socket.emit('msg_status_update', { msgId, status: 'sent' });
+        }
     });
 
+    // 3. Seen/Read Status (Blue Ticks)
+    socket.on('mark_as_read', ({ msgId, senderId }) => {
+        const senderSocketId = activeUsers.get(senderId);
+        if (senderSocketId) {
+            io.to(senderSocketId).emit('msg_status_update', { msgId, status: 'read' }); // 🔵 Blue Tick
+        }
+    });
+
+    // 4. Typing Indicator
+    socket.on('typing', ({ senderId, receiverId, isTyping }) => {
+        const receiverSocketId = activeUsers.get(receiverId);
+        if (receiverSocketId) {
+            io.to(receiverSocketId).emit('typing_status', { senderId, isTyping });
+        }
+    });
+
+    // 5. User Offline
     socket.on('disconnect', () => {
-        console.log(`🔌 User disconnected: ${socket.id}`);
+        let disconnectedUid = null;
+        for (let [uid, sid] of activeUsers.entries()) {
+            if (sid === socket.id) {
+                disconnectedUid = uid;
+                activeUsers.delete(uid);
+                break;
+            }
+        }
+        if (disconnectedUid) {
+            console.log(`🔴 User Offline: ${disconnectedUid}`);
+            io.emit('user_status_change', { uid: disconnectedUid, status: 'offline' });
+        }
     });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Secure E2EE Chat Server running on port ${PORT}`);
-});
+server.listen(3000, () => console.log(`🚀 Ultra-Fast Chat Server Running on Port 3000`));
