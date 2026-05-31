@@ -4,84 +4,47 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 
-// Config file se database (db) import karein
-const { db } = require('./config'); 
-
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-const activeUsers = new Map();
+// Online users ko track karne ke liye
+let onlineUsers = {}; 
 
 io.on('connection', (socket) => {
-    
-    // User online aata hai
-    socket.on('user_online', (uid) => {
-        activeUsers.set(uid, socket.id);
-        console.log(`🟢 User Online: ${uid}`);
-        
-        // TODO: Jaise hi user online aaye, aap yahan DB se uske offline messages fetch karke bhej sakte hain
+    console.log(`⚡ New Device Connected: ${socket.id}`);
+
+    // 1. User apne device ka naam batata hai
+    socket.on('register_device', (deviceName) => {
+        onlineUsers[socket.id] = { id: socket.id, name: deviceName };
+        // Sabko updated list bhejo
+        io.emit('update_user_list', Object.values(onlineUsers));
     });
 
-    // Jab koi E2EE message ya file bhejta hai
-    socket.on('send_private_msg', async (payload) => {
-        const { msgId, senderId, receiverId, encryptedData, type, fileName } = payload;
-        const receiverSocket = activeUsers.get(receiverId);
-
-        if (receiverSocket) {
-            // Receiver ONLINE hai -> Direct WebSockets (Fastest Delivery)
-            io.to(receiverSocket).emit('receive_private_msg', payload);
-            console.log(`⚡ Fast delivery to ${receiverId}`);
-        } else {
-            // Receiver OFFLINE hai -> Firebase Realtime DB me save karo
-            console.log(`🟡 ${receiverId} offline hai. Saving to Firebase...`);
-            
-            try {
-                // Firebase me 'offline_messages/receiverId/msgId' ke format me save karenge
-                const messageRef = db.ref(`offline_messages/${receiverId}/${msgId}`);
-                
-                await messageRef.set({
-                    senderId: senderId,
-                    encryptedData: encryptedData, // Server ke paas sirf ye cipher-text aayega
-                    type: type,
-                    fileName: fileName || null,
-                    timestamp: Date.now()
-                });
-
-                // Sender ko batao ki msg successfully server/DB tak pahunch gaya (Single Tick ✓)
-                socket.emit('msg_status_update', { msgId: msgId, status: 'saved_to_db' });
-                
-            } catch (error) {
-                console.error("Firebase saving error: ", error);
-            }
-        }
+    // 2. Connection Request bhejna (User A -> User B)
+    socket.on('send_request', (data) => {
+        const { targetId, senderName } = data;
+        io.to(targetId).emit('incoming_request', { senderId: socket.id, senderName });
     });
 
-    // Seen/Read Ticks (Double Blue Ticks)
-    socket.on('mark_as_read', ({ msgId, senderId }) => {
-        const senderSocket = activeUsers.get(senderId);
-        if (senderSocket) {
-            io.to(senderSocket).emit('msg_status_update', { msgId, status: 'read' });
-        }
+    // 3. Request Accept/Deny karna (User B -> User A)
+    socket.on('request_response', (data) => {
+        const { senderId, status, responderName } = data; // status: 'accepted' or 'denied'
+        io.to(senderId).emit('request_status', { responderId: socket.id, responderName, status });
     });
 
-    // User logout karta hai
-    socket.on('user_offline', (uid) => {
-        activeUsers.delete(uid);
-        console.log(`🔴 User Offline: ${uid}`);
-    });
+    // === WEBRTC SIGNALING (For building the P2P tunnel) ===
+    socket.on('webrtc_offer', (data) => io.to(data.target).emit('webrtc_offer', data));
+    socket.on('webrtc_answer', (data) => io.to(data.target).emit('webrtc_answer', data));
+    socket.on('webrtc_ice_candidate', (data) => io.to(data.target).emit('webrtc_ice_candidate', data));
 
-    // Connection tootne par (browser close etc.)
+    // 4. User Disconnect
     socket.on('disconnect', () => {
-        for (let [uid, sid] of activeUsers.entries()) {
-            if (sid === socket.id) {
-                activeUsers.delete(uid);
-                console.log(`🔌 Connection closed for: ${uid}`);
-            }
-        }
+        delete onlineUsers[socket.id];
+        io.emit('update_user_list', Object.values(onlineUsers));
+        console.log(`🔌 Device Disconnected: ${socket.id}`);
     });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 NexChat API Running on Port ${PORT}`));
+server.listen(3000, () => console.log(`🚀 Matchmaker Server Running on Port 3000`));
